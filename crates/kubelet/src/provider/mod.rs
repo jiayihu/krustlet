@@ -116,7 +116,13 @@ pub trait Provider: Sized + Send + Sync + 'static {
     ///
     /// The default implementation of this returns a message that this feature is
     /// not available. Override this only when there is an implementation.
-    async fn exec(&self, _pod: Pod, _command: String) -> anyhow::Result<Vec<String>> {
+    async fn exec(
+        &self,
+        _namespace: String,
+        _pod: String,
+        _container: String,
+        _command: String,
+    ) -> anyhow::Result<Vec<String>> {
         Err(NotImplementedError.into())
     }
 

@@ -94,6 +94,7 @@ pub(crate) mod plugin_watcher;
 pub mod backoff;
 pub mod config;
 pub mod container;
+pub mod exec;
 pub mod handle;
 pub mod log;
 pub mod node;

@@ -165,6 +165,28 @@ impl Provider for WasiProvider {
             })?;
         handle.output(&container_name, sender).await
     }
+
+    async fn exec(
+        &self,
+        namespace: String,
+        pod_name: String,
+        container_name: String,
+        command: String,
+    ) -> anyhow::Result<Vec<String>> {
+        info!(
+            "Executing command {} for container {} in pod {}",
+            command, container_name, pod_name
+        );
+
+        let handles = self.shared.handles.read().await;
+        let handle = handles
+            .get(&PodKey::new(&namespace, &pod_name))
+            .ok_or_else(|| ProviderError::PodNotFound {
+                pod_name: pod_name.clone(),
+            })?;
+
+        handle.exec(container_name, command).await
+    }
 }
 
 impl GenericProvider for WasiProvider {

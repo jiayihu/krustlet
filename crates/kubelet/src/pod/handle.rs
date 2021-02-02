@@ -7,7 +7,7 @@ use tokio::sync::RwLock;
 use crate::container::{
     ContainerKey, ContainerMapByName, Handle as ContainerHandle, HandleMap as ContainerHandleMap,
 };
-use crate::handle::StopHandler;
+use crate::handle::{ExecHandler, StopHandler};
 use crate::log::{HandleFactory, Sender};
 use crate::pod::Pod;
 use crate::provider::ProviderError;
@@ -33,7 +33,7 @@ impl<H, F> std::fmt::Debug for Handle<H, F> {
     }
 }
 
-impl<H: StopHandler, F> Handle<H, F> {
+impl<H: StopHandler + ExecHandler, F> Handle<H, F> {
     /// Creates a new pod handle that manages the given map of container names to
     /// [`ContainerHandle`]s. The given pod and client are used to maintain a reference to the
     /// kubernetes object and to be able to update the status of that object. The optional volumes
@@ -72,6 +72,23 @@ impl<H: StopHandler, F> Handle<H, F> {
                 container_name: container_name.to_owned(),
             })?;
         handle.output(sender).await
+    }
+
+    /// Exec a command in the specified container
+    pub async fn exec(
+        &self,
+        container_name: String,
+        command: String,
+    ) -> anyhow::Result<Vec<String>> {
+        let mut handles = self.container_handles.write().await;
+        let handle = handles
+            .get_mut_by_name(container_name.clone())
+            .ok_or_else(|| ProviderError::ContainerNotFound {
+                pod_name: self.pod.name().to_string(),
+                container_name: container_name.clone(),
+            })?;
+
+        handle.exec(command).await
     }
 
     /// Signal the pod and all its running containers to stop and wait for them

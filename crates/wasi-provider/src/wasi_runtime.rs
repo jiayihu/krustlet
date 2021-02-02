@@ -1,28 +1,33 @@
 use anyhow::bail;
 use futures::task;
+use kubelet::exec::parse_command;
 use log::{debug, error, info, trace};
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{channel as std_channel, Receiver as StdReceiver, Sender as StdSender};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use tempfile::NamedTempFile;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot;
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use wasi_common::preopen_dir;
-use wasmtime::InterruptHandle;
+use wasmtime::{InterruptHandle, Val};
 use wasmtime_wasi::old::snapshot_0::Wasi as WasiUnstable;
 use wasmtime_wasi::{Wasi, WasiCtxBuilder};
 
 use kubelet::container::Handle as ContainerHandle;
 use kubelet::container::Status;
-use kubelet::handle::StopHandler;
+use kubelet::handle::{ExecHandler, StopHandler};
 
 pub struct Runtime {
     handle: JoinHandle<anyhow::Result<()>>,
     interrupt_handle: InterruptHandle,
+    command_tx: Arc<Mutex<StdSender<String>>>,
+    response_rx: Arc<Mutex<StdReceiver<String>>>,
 }
 
 #[async_trait::async_trait]
@@ -35,6 +40,26 @@ impl StopHandler for Runtime {
     async fn wait(&mut self) -> anyhow::Result<()> {
         (&mut self.handle).await??;
         Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl ExecHandler for Runtime {
+    async fn exec(&mut self, command: String) -> anyhow::Result<Vec<String>> {
+        info!("Executing command in the runtime {}", command);
+
+        let command_tx = self.command_tx.lock().await;
+        let response_rx = self.response_rx.lock().await;
+
+        command_tx
+            .send(command)
+            .map_err(|_| anyhow::anyhow!("Cannot send the exec command to the runtime"))?;
+
+        let response = response_rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("Cannot receive the exec response from the runtime"))?;
+
+        Ok(vec![response])
     }
 }
 
@@ -130,7 +155,8 @@ impl WasiRuntime {
         })
         .await??;
 
-        let (interrupt_handle, handle) = self.spawn_wasmtime(output_write).await?;
+        let (interrupt_handle, handle, command_tx, response_rx) =
+            self.spawn_wasmtime(output_write).await?;
 
         let log_handle_factory = HandleFactory {
             temp: self.output.clone(),
@@ -140,6 +166,8 @@ impl WasiRuntime {
             Runtime {
                 handle,
                 interrupt_handle,
+                command_tx: Arc::new(Mutex::new(command_tx)),
+                response_rx: Arc::new(Mutex::new(response_rx)),
             },
             log_handle_factory,
         ))
@@ -151,12 +179,19 @@ impl WasiRuntime {
     async fn spawn_wasmtime(
         &self,
         output_write: std::fs::File,
-    ) -> anyhow::Result<(InterruptHandle, JoinHandle<anyhow::Result<()>>)> {
+    ) -> anyhow::Result<(
+        InterruptHandle,
+        JoinHandle<anyhow::Result<()>>,
+        StdSender<String>,
+        StdReceiver<String>,
+    )> {
         // Clone the module data Arc so it can be moved
         let data = self.data.clone();
         let name = self.name.clone();
         let status_sender = self.status_sender.clone();
-        let (tx, rx) = oneshot::channel();
+        let (interrupt_tx, interrupt_rx) = oneshot::channel();
+        let (command_tx, command_rx): (StdSender<String>, StdReceiver<String>) = std_channel();
+        let (response_tx, response_rx): (StdSender<String>, StdReceiver<String>) = std_channel();
 
         let handle = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             let waker = task::noop_waker();
@@ -194,7 +229,8 @@ impl WasiRuntime {
             let engine = wasmtime::Engine::new(&config);
             let store = wasmtime::Store::new(&engine);
             let interrupt = store.interrupt_handle()?;
-            tx.send(interrupt)
+            interrupt_tx
+                .send(interrupt)
                 .map_err(|_| anyhow::anyhow!("Unable to send interrupt back to main thread"))?;
 
             let wasi_snapshot = Wasi::new(&store, wasi_ctx_snapshot);
@@ -290,65 +326,146 @@ impl WasiRuntime {
                 },
                 &mut cx,
             );
-            let export = instance
-                .get_export("_start")
-                .ok_or_else(|| anyhow::anyhow!("_start import doesn't exist in wasm module"))?;
-            let func = match export {
-                wasmtime::Extern::Func(f) => f,
-                _ => {
-                    let message = "_start import was not a function. This is likely a problem with the module";
-                    error!("{}", message);
+            let export = instance.get_export("_start");
+
+            match export {
+                Some(export) => {
+                    // Drop the channels so that any command fails
+                    drop(command_rx);
+                    drop(response_tx);
+
+                    let func = match export {
+                        wasmtime::Extern::Func(f) => f,
+                        _ => {
+                            let message = "_start import was not a function. This is likely a problem with the module";
+                            error!("{}", message);
+                            send(
+                                status_sender.clone(),
+                                name.clone(),
+                                Status::Terminated {
+                                    failed: true,
+                                    message: message.into(),
+                                    timestamp: chrono::Utc::now(),
+                                },
+                                &mut cx,
+                            );
+
+                            return Err(anyhow::anyhow!(message));
+                        }
+                    };
+                    match func.call(&[]) {
+                        // We can't map errors here or it moves the send channel, so we
+                        // do it in a match
+                        Ok(_) => {}
+                        Err(e) => {
+                            let message = "unable to run module";
+                            error!("{}: {:?}", message, e);
+                            send(
+                                status_sender.clone(),
+                                name.clone(),
+                                Status::Terminated {
+                                    failed: true,
+                                    message: message.into(),
+                                    timestamp: chrono::Utc::now(),
+                                },
+                                &mut cx,
+                            );
+                            return Err(anyhow::anyhow!("{}: {}", message, e));
+                        }
+                    };
+
+                    info!("module run complete");
                     send(
                         status_sender.clone(),
-                        name.clone(),
+                        name,
                         Status::Terminated {
-                            failed: true,
-                            message: message.into(),
+                            failed: false,
+                            message: "Module run completed".into(),
                             timestamp: chrono::Utc::now(),
                         },
                         &mut cx,
                     );
+                }
+                None => {
+                    info!("_start import doesn't exist in wasm module");
 
-                    return Err(anyhow::anyhow!(message));
+                    while let Ok(command) = command_rx.recv() {
+                        info!("Received command {}", command);
+
+                        let command = parse_command(&command)
+                            .map_err(|e| anyhow::anyhow!("Error parsing the command {}", e));
+
+                        let result = command.and_then(|command| {
+                            let func =
+                                instance.get_func(command.function.as_str()).ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "No function found with name {}",
+                                        command.function
+                                    )
+                                });
+
+                            let call_result = func.and_then(|func| {
+                                let args: anyhow::Result<Vec<Val>> = command
+                                    .args
+                                    .into_iter()
+                                    .map(|arg| {
+                                        let val =
+                                            arg.parse::<i32>().map(|v| Val::from(v)).map_err(|e| {
+                                                anyhow::anyhow!(
+                                                    "Error parsing argument {} to i32: {}",
+                                                    arg,
+                                                    e
+                                                )
+                                            });
+
+                                        val
+                                    })
+                                    .collect();
+
+                                let result = args.and_then(|args| {
+                                    let result = func
+                                        .call(&args[..])
+                                        .map(|result| {
+                                            let values: Vec<String> = result
+                                                .into_iter()
+                                                .map(|v| format!("{:?}", v))
+                                                .collect();
+                                            let message = values.join(", ");
+
+                                            message
+                                        })
+                                        .map_err(|e| {
+                                            anyhow::anyhow!("Error executing command {}", e)
+                                        });
+
+                                    result
+                                });
+
+                                result
+                            });
+
+                            call_result
+                        });
+
+                        let message = match result {
+                            Ok(r) => format!("{}", r),
+                            Err(e) => format!("{}", e),
+                        };
+
+                        response_tx
+                            .send(message)
+                            .map_err(|_| anyhow::anyhow!("Unable to send the command response"))?
+                    }
+
+                    return Err(anyhow::anyhow!("Command channel dropped"));
                 }
             };
-            match func.call(&[]) {
-                // We can't map errors here or it moves the send channel, so we
-                // do it in a match
-                Ok(_) => {}
-                Err(e) => {
-                    let message = "unable to run module";
-                    error!("{}: {:?}", message, e);
-                    send(
-                        status_sender.clone(),
-                        name.clone(),
-                        Status::Terminated {
-                            failed: true,
-                            message: message.into(),
-                            timestamp: chrono::Utc::now(),
-                        },
-                        &mut cx,
-                    );
-                    return Err(anyhow::anyhow!("{}: {}", message, e));
-                }
-            };
 
-            info!("module run complete");
-            send(
-                status_sender.clone(),
-                name,
-                Status::Terminated {
-                    failed: false,
-                    message: "Module run completed".into(),
-                    timestamp: chrono::Utc::now(),
-                },
-                &mut cx,
-            );
             Ok(())
         });
         // Wait for the interrupt to be sent back to us
-        let interrupt = rx.await?;
-        Ok((interrupt, handle))
+        let interrupt = interrupt_rx.await?;
+        Ok((interrupt, handle, command_tx, response_rx))
     }
 }
 

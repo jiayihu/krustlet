@@ -3,7 +3,7 @@ use std::io::SeekFrom;
 use tokio::io::{AsyncRead, AsyncSeek, AsyncSeekExt};
 
 use crate::container::ContainerMap;
-use crate::handle::StopHandler;
+use crate::handle::{ExecHandler, StopHandler};
 use crate::log::{stream, HandleFactory, Sender};
 
 /// Represents a handle to a running "container" (whatever that might be). This
@@ -55,6 +55,12 @@ impl<H: StopHandler, F> Handle<H, F> {
     /// [`StopHandler`] implementation passed to the constructor
     pub async fn wait(&mut self) -> anyhow::Result<()> {
         self.handle.wait().await
+    }
+}
+
+impl<H: ExecHandler, F> Handle<H, F> {
+    pub(crate) async fn exec(&mut self, command: String) -> anyhow::Result<Vec<String>> {
+        self.handle.exec(command).await
     }
 }
 

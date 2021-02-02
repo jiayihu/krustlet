@@ -1,5 +1,6 @@
 use crate::config::ServerConfig;
-use crate::log::{Options, Sender};
+use crate::exec::Options as CommandOptions;
+use crate::log::{Options as LogOptions, Sender};
 use crate::provider::{NotImplementedError, Provider};
 use http::status::StatusCode;
 use http::Response;
@@ -27,7 +28,7 @@ pub(crate) async fn start<T: Provider>(
     let logs_provider = provider.clone();
     let logs = warp::get()
         .and(warp::path!("containerLogs" / String / String / String))
-        .and(warp::query::<Options>())
+        .and(warp::query::<LogOptions>())
         .and_then(move |namespace, pod, container, opts| {
             let provider = logs_provider.clone();
             get_container_logs(provider, namespace, pod, container, opts)
@@ -36,9 +37,10 @@ pub(crate) async fn start<T: Provider>(
     let exec_provider = provider.clone();
     let exec = warp::post()
         .and(warp::path!("exec" / String / String / String))
-        .and_then(move |namespace, pod, container| {
+        .and(warp::query::<CommandOptions>())
+        .and_then(move |namespace, pod, container, opts| {
             let provider = exec_provider.clone();
-            post_exec(provider, namespace, pod, container)
+            post_exec(provider, namespace, pod, container, opts)
         });
 
     let routes = ping.or(health).or(logs).or(exec);
@@ -60,7 +62,7 @@ async fn get_container_logs<T: Provider>(
     namespace: String,
     pod: String,
     container: String,
-    opts: Options,
+    opts: LogOptions,
 ) -> Result<Response<Body>, Infallible> {
     debug!(
         "Got container log request for container {} in pod {} in namespace {}. Options: {:?}.",
@@ -92,15 +94,30 @@ async fn get_container_logs<T: Provider>(
 ///
 /// Implements the kubelet path /exec/{namespace}/{pod}/{container}
 async fn post_exec<T: Provider>(
-    _provider: Arc<T>,
-    _namespace: String,
-    _pod: String,
-    _container: String,
+    provider: Arc<T>,
+    namespace: String,
+    pod: String,
+    container: String,
+    opts: CommandOptions,
 ) -> Result<Response<Body>, Infallible> {
-    return_with_code(
-        StatusCode::NOT_IMPLEMENTED,
-        "Exec not implemented.".to_string(),
-    )
+    debug!(
+        "Got container exec request for container {} in pod {} in namespace {}. Options: {:?}",
+        namespace, pod, container, opts
+    );
+    let command = opts.command;
+
+    match provider.exec(namespace, pod, container, command).await {
+        Ok(lines) => {
+            let body = Body::from(lines.join(", "));
+
+            Ok(Response::new(body))
+        }
+        Err(e) => {
+            let message = format!("{}", e);
+
+            return_with_code(StatusCode::INTERNAL_SERVER_ERROR, message)
+        }
+    }
 }
 
 fn return_with_code(code: StatusCode, body: String) -> Result<Response<Body>, Infallible> {
