@@ -1,13 +1,14 @@
 //! A crate for building custom Kubernetes [kubelets](https://kubernetes.io/docs/reference/command-line-tools-reference/kubelet/).
 //!
-//! The crate provides the [`Provider`] trait for declaring a Kubelet backend
-//! as well as a the [`Kubelet`] type which takes a [`Provider`] and runs
-//! a Kubelet server.
+//! The crate provides the [`Provider`](crate::provider::Provider) trait for declaring a Kubelet
+//! backend as well as a the [`Kubelet`] type which takes a [`Provider`](crate::provider::Provider)
+//! and runs a Kubelet server.
 //!
 //! # Example
 //! ```rust,no_run
 //! use kubelet::Kubelet;
 //! use kubelet::config::Config;
+//! use kubelet::plugin_watcher::PluginRegistry;
 //! use kubelet::pod::Pod;
 //! use kubelet::provider::Provider;
 //! use std::sync::Arc;
@@ -43,7 +44,11 @@
 //!     fn provider_state(&self) -> SharedState<ProviderState> {
 //!         Arc::new(RwLock::new(ProviderState {}))
 //!     }
-//!    
+//!
+//!     fn plugin_registry(&self) -> Option<Arc<PluginRegistry>> {
+//!         Some(Arc::new(Default::default()))
+//!     }
+//!
 //!     async fn initialize_pod_state(&self, _pod: &Pod) -> anyhow::Result<Self::PodState> {
 //!         Ok(PodState)
 //!     }
@@ -79,9 +84,9 @@ pub(crate) mod kubeconfig;
 pub(crate) mod webserver;
 pub(crate) mod plugin_registration_api {
     pub(crate) mod v1 {
-        pub const API_VERSION: &str = "v1";
+        pub const API_VERSION: &str = "1.0.0";
 
-        tonic::include_proto!("pluginregistration.v1");
+        tonic::include_proto!("pluginregistration");
     }
 }
 pub(crate) mod fs_watch;
@@ -89,7 +94,6 @@ pub(crate) mod grpc_sock;
 #[cfg(target_family = "windows")]
 #[allow(dead_code)]
 pub(crate) mod mio_uds_windows;
-pub(crate) mod plugin_watcher;
 
 pub mod backoff;
 pub mod config;
@@ -98,6 +102,7 @@ pub mod exec;
 pub mod handle;
 pub mod log;
 pub mod node;
+pub mod plugin_watcher;
 pub mod pod;
 pub mod provider;
 pub mod secret;

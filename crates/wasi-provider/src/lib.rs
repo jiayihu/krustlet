@@ -18,9 +18,10 @@
 //!
 //!     // Load a kubernetes configuration
 //!     let kubeconfig = kube::Config::infer().await.unwrap();
+//!     let plugin_registry = Arc::new(Default::default());
 //!
 //!     // Instantiate the provider type
-//!     let provider = WasiProvider::new(store, &kubelet_config, kubeconfig.clone()).await.unwrap();
+//!     let provider = WasiProvider::new(store, &kubelet_config, kubeconfig.clone(), plugin_registry).await.unwrap();
 //!
 //!     // Instantiate the Kubelet
 //!     let kubelet = Kubelet::new(provider, kubeconfig, kubelet_config).await.unwrap();
@@ -40,6 +41,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use kubelet::exec::CommandOptions;
 use kubelet::node::Builder;
+use kubelet::plugin_watcher::PluginRegistry;
 use kubelet::pod::state::prelude::SharedState;
 use kubelet::pod::{Handle, Pod, PodKey};
 use kubelet::provider::{Provider, ProviderError};
@@ -75,6 +77,7 @@ pub struct ProviderState {
     log_path: PathBuf,
     kubeconfig: kube::Config,
     volume_path: PathBuf,
+    plugin_registry: Arc<PluginRegistry>,
 }
 
 #[async_trait]
@@ -87,6 +90,9 @@ impl GenericProviderState for ProviderState {
     }
     fn volume_path(&self) -> PathBuf {
         self.volume_path.clone()
+    }
+    fn plugin_registry(&self) -> Option<Arc<PluginRegistry>> {
+        Some(self.plugin_registry.clone())
     }
     async fn stop(&self, pod: &Pod) -> anyhow::Result<()> {
         let key = PodKey::from(pod);
@@ -105,6 +111,7 @@ impl WasiProvider {
         store: Arc<dyn Store + Sync + Send>,
         config: &kubelet::config::Config,
         kubeconfig: kube::Config,
+        plugin_registry: Arc<PluginRegistry>,
     ) -> anyhow::Result<Self> {
         let log_path = config.data_dir.join(LOG_DIR_NAME);
         let volume_path = config.data_dir.join(VOLUME_DIR);
@@ -117,6 +124,7 @@ impl WasiProvider {
                 log_path,
                 volume_path,
                 kubeconfig,
+                plugin_registry,
             },
         })
     }
@@ -184,6 +192,10 @@ impl Provider for WasiProvider {
             })?;
 
         handle.exec(container_name, command).await
+    }
+
+    fn plugin_registry(&self) -> Option<Arc<PluginRegistry>> {
+        Some(self.shared.plugin_registry.clone())
     }
 }
 
