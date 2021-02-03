@@ -1,5 +1,5 @@
 use crate::config::ServerConfig;
-use crate::exec::Options as CommandOptions;
+use crate::exec::{Command, CommandOptions};
 use crate::log::{Options as LogOptions, Sender};
 use crate::provider::{NotImplementedError, Provider};
 use http::status::StatusCode;
@@ -37,7 +37,9 @@ pub(crate) async fn start<T: Provider>(
     let exec_provider = provider.clone();
     let exec = warp::post()
         .and(warp::path!("exec" / String / String / String))
-        .and(warp::query::<CommandOptions>())
+        // The default query filter doesn't allow duplicate command query, which instead happens with
+        // exec, e.g. `?command=add&command=1&command=2`
+        .and(warp::query::raw())
         .and_then(move |namespace, pod, container, opts| {
             let provider = exec_provider.clone();
             post_exec(provider, namespace, pod, container, opts)
@@ -98,25 +100,25 @@ async fn post_exec<T: Provider>(
     namespace: String,
     pod: String,
     container: String,
-    opts: CommandOptions,
+    query: String,
 ) -> Result<Response<Body>, Infallible> {
     debug!(
-        "Got container exec request for container {} in pod {} in namespace {}. Options: {:?}",
-        namespace, pod, container, opts
+        "Got container exec request for container {} in pod {} in namespace {}. Query: {:?}",
+        namespace, pod, container, query
     );
-    let command = opts.command;
 
-    match provider.exec(namespace, pod, container, command).await {
-        Ok(lines) => {
-            let body = Body::from(lines.join(", "));
+    let opts = parse_exec_query(&query);
 
-            Ok(Response::new(body))
-        }
-        Err(e) => {
-            let message = format!("{}", e);
+    match opts {
+        Ok(opts) => match provider.exec(namespace, pod, container, opts).await {
+            Ok(result) => {
+                let body = Body::from(result);
 
-            return_with_code(StatusCode::INTERNAL_SERVER_ERROR, message)
-        }
+                Ok(Response::new(body))
+            }
+            Err(e) => return_with_code(StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)),
+        },
+        Err(e) => return_with_code(StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)),
     }
 }
 
@@ -124,4 +126,44 @@ fn return_with_code(code: StatusCode, body: String) -> Result<Response<Body>, In
     let mut response = Response::new(body.into());
     *response.status_mut() = code;
     Ok(response)
+}
+
+fn parse_exec_query(query: &String) -> anyhow::Result<CommandOptions> {
+    let mut function: Option<String> = None;
+    let mut args: Vec<String> = Vec::new();
+    let pairs = query.split("&");
+
+    for pair in pairs {
+        let keyvalue: Vec<&str> = pair.split("=").collect();
+        let key = keyvalue
+            .get(0)
+            .ok_or_else(|| anyhow::anyhow!("Cannot get the query key"))?
+            .to_string();
+        let value = keyvalue
+            .get(1)
+            .ok_or_else(|| anyhow::anyhow!("Cannot get the query value"))?
+            .to_string();
+
+        if key.as_str() == "command" && !function.is_some() {
+            function = Some(value);
+        } else if key.as_str() == "command" && function.is_some() {
+            args.push(value);
+        }
+
+        // TODO: any other query param like stderr, stdin, tty is not supported yet
+    }
+
+    function
+        .map(|f| {
+            let command = Command { function: f, args };
+
+            CommandOptions {
+                command,
+                stdin: false,
+                stdout: false,
+                stderr: false,
+                tty: false,
+            }
+        })
+        .ok_or_else(|| anyhow::anyhow!("Error while parsing the exec query string"))
 }

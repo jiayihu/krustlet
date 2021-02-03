@@ -3,6 +3,7 @@ use std::io::SeekFrom;
 use tokio::io::{AsyncRead, AsyncSeek, AsyncSeekExt};
 
 use crate::container::ContainerMap;
+use crate::exec::Command;
 use crate::handle::{ExecHandler, StopHandler};
 use crate::log::{stream, HandleFactory, Sender};
 
@@ -59,7 +60,7 @@ impl<H: StopHandler, F> Handle<H, F> {
 }
 
 impl<H: ExecHandler, F> Handle<H, F> {
-    pub(crate) async fn exec(&mut self, command: String) -> anyhow::Result<Vec<String>> {
+    pub(crate) async fn exec(&mut self, command: Command) -> anyhow::Result<String> {
         self.handle.exec(command).await
     }
 }

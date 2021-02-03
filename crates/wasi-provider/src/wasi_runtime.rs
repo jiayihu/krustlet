@@ -1,6 +1,6 @@
 use anyhow::bail;
 use futures::task;
-use kubelet::exec::parse_command;
+use kubelet::exec::Command;
 use log::{debug, error, info, trace};
 use std::collections::HashMap;
 use std::convert::TryFrom;
@@ -15,7 +15,7 @@ use tokio::sync::oneshot;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use wasi_common::preopen_dir;
-use wasmtime::{InterruptHandle, Val};
+use wasmtime::{FuncType, InterruptHandle, Val, ValType};
 use wasmtime_wasi::old::snapshot_0::Wasi as WasiUnstable;
 use wasmtime_wasi::{Wasi, WasiCtxBuilder};
 
@@ -26,8 +26,8 @@ use kubelet::handle::{ExecHandler, StopHandler};
 pub struct Runtime {
     handle: JoinHandle<anyhow::Result<()>>,
     interrupt_handle: InterruptHandle,
-    command_tx: Arc<Mutex<StdSender<String>>>,
-    response_rx: Arc<Mutex<StdReceiver<String>>>,
+    command_tx: Arc<Mutex<StdSender<Command>>>,
+    response_rx: Arc<Mutex<StdReceiver<anyhow::Result<String>>>>,
 }
 
 #[async_trait::async_trait]
@@ -45,9 +45,7 @@ impl StopHandler for Runtime {
 
 #[async_trait::async_trait]
 impl ExecHandler for Runtime {
-    async fn exec(&mut self, command: String) -> anyhow::Result<Vec<String>> {
-        info!("Executing command in the runtime {}", command);
-
+    async fn exec(&mut self, command: Command) -> anyhow::Result<String> {
         let command_tx = self.command_tx.lock().await;
         let response_rx = self.response_rx.lock().await;
 
@@ -59,7 +57,7 @@ impl ExecHandler for Runtime {
             .recv()
             .map_err(|_| anyhow::anyhow!("Cannot receive the exec response from the runtime"))?;
 
-        Ok(vec![response])
+        response
     }
 }
 
@@ -182,16 +180,16 @@ impl WasiRuntime {
     ) -> anyhow::Result<(
         InterruptHandle,
         JoinHandle<anyhow::Result<()>>,
-        StdSender<String>,
-        StdReceiver<String>,
+        StdSender<Command>,
+        StdReceiver<anyhow::Result<String>>,
     )> {
         // Clone the module data Arc so it can be moved
         let data = self.data.clone();
         let name = self.name.clone();
         let status_sender = self.status_sender.clone();
         let (interrupt_tx, interrupt_rx) = oneshot::channel();
-        let (command_tx, command_rx): (StdSender<String>, StdReceiver<String>) = std_channel();
-        let (response_tx, response_rx): (StdSender<String>, StdReceiver<String>) = std_channel();
+        let (command_tx, command_rx): (StdSender<Command>, StdReceiver<Command>) = std_channel();
+        let (response_tx, response_rx) = std_channel();
 
         let handle = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             let waker = task::noop_waker();
@@ -390,70 +388,37 @@ impl WasiRuntime {
                     info!("_start import doesn't exist in wasm module");
 
                     while let Ok(command) = command_rx.recv() {
-                        info!("Received command {}", command);
+                        info!("Received exec command {:?}", command);
 
-                        let command = parse_command(&command)
-                            .map_err(|e| anyhow::anyhow!("Error parsing the command {}", e));
+                        let func = instance.get_func(command.function.as_str()).ok_or_else(|| {
+                            anyhow::anyhow!("No function found with name {}", command.function)
+                        });
 
-                        let result = command.and_then(|command| {
-                            let func =
-                                instance.get_func(command.function.as_str()).ok_or_else(|| {
-                                    anyhow::anyhow!(
-                                        "No function found with name {}",
-                                        command.function
-                                    )
-                                });
+                        let result = func.and_then(|func| {
+                            let args = parse_args(func.ty(), &command.args);
 
-                            let call_result = func.and_then(|func| {
-                                let args: anyhow::Result<Vec<Val>> = command
-                                    .args
-                                    .into_iter()
-                                    .map(|arg| {
-                                        let val =
-                                            arg.parse::<i32>().map(|v| Val::from(v)).map_err(|e| {
-                                                anyhow::anyhow!(
-                                                    "Error parsing argument {} to i32: {}",
-                                                    arg,
-                                                    e
-                                                )
-                                            });
+                            let result = args.and_then(|args| {
+                                let result = func
+                                    .call(&args)
+                                    .map(|result| {
+                                        let values: Vec<String> =
+                                            result.into_iter().map(|v| stringify_val(v)).collect();
+                                        let message = values.join("\n");
 
-                                        val
+                                        info!("Exec command result: {}", message);
+
+                                        message
                                     })
-                                    .collect();
-
-                                let result = args.and_then(|args| {
-                                    let result = func
-                                        .call(&args[..])
-                                        .map(|result| {
-                                            let values: Vec<String> = result
-                                                .into_iter()
-                                                .map(|v| format!("{:?}", v))
-                                                .collect();
-                                            let message = values.join(", ");
-
-                                            message
-                                        })
-                                        .map_err(|e| {
-                                            anyhow::anyhow!("Error executing command {}", e)
-                                        });
-
-                                    result
-                                });
+                                    .map_err(|e| anyhow::anyhow!("Error executing command {}", e));
 
                                 result
                             });
 
-                            call_result
+                            result
                         });
 
-                        let message = match result {
-                            Ok(r) => format!("{}", r),
-                            Err(e) => format!("{}", e),
-                        };
-
                         response_tx
-                            .send(message)
+                            .send(result)
                             .map_err(|_| anyhow::anyhow!("Unable to send the command response"))?
                     }
 
@@ -482,5 +447,44 @@ fn send(mut sender: Sender<Status>, name: String, status: Status, cx: &mut Conte
             "Channel for container {} not ready for send. Attempting again",
             name
         );
+    }
+}
+
+// The implementation is taken from how wasmtime handles `--invoke` in CLI
+// https://github.com/bytecodealliance/wasmtime/blob/256cc8a5185c8d2ee82838fe2b12c8672baa69a3/src/commands/run.rs#L281
+fn parse_args(func_type: FuncType, args: &Vec<String>) -> anyhow::Result<Vec<Val>> {
+    let params = func_type.params();
+    let mut args = args.iter();
+    let mut values = Vec::with_capacity(params.len());
+    for ty in params {
+        let arg = match args.next() {
+            Some(s) => s,
+            None => {
+                anyhow::bail!("Not enough arguments");
+            }
+        };
+        let value = match ty {
+            ValType::I32 => Val::I32(arg.parse()?),
+            ValType::I64 => Val::I64(arg.parse()?),
+            ValType::F32 => Val::F32(arg.parse()?),
+            ValType::F64 => Val::F64(arg.parse()?),
+            t => anyhow::bail!("Unsupported argument type {:?}", t),
+        };
+
+        values.push(value)
+    }
+
+    Ok(values)
+}
+
+fn stringify_val(val: &Val) -> String {
+    match val {
+        Val::I32(i) => format!("{}", i),
+        Val::I64(i) => format!("{}", i),
+        Val::F32(f) => format!("{}", f),
+        Val::F64(f) => format!("{}", f),
+        Val::ExternRef(_) => format!("<externref>"),
+        Val::FuncRef(_) => format!("<externref>"),
+        Val::V128(i) => format!("{}", i),
     }
 }

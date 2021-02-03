@@ -8,6 +8,7 @@ use log::{error, info};
 use thiserror::Error;
 
 use crate::container::Container;
+use crate::exec::CommandOptions;
 use crate::log::Sender;
 use crate::node::Builder;
 use crate::pod::Pod;
@@ -121,8 +122,8 @@ pub trait Provider: Sized + Send + Sync + 'static {
         _namespace: String,
         _pod: String,
         _container: String,
-        _command: String,
-    ) -> anyhow::Result<Vec<String>> {
+        _opts: CommandOptions,
+    ) -> anyhow::Result<String> {
         Err(NotImplementedError.into())
     }
 

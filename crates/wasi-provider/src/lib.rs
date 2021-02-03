@@ -38,6 +38,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use kubelet::exec::CommandOptions;
 use kubelet::node::Builder;
 use kubelet::pod::state::prelude::SharedState;
 use kubelet::pod::{Handle, Pod, PodKey};
@@ -171,12 +172,9 @@ impl Provider for WasiProvider {
         namespace: String,
         pod_name: String,
         container_name: String,
-        command: String,
-    ) -> anyhow::Result<Vec<String>> {
-        info!(
-            "Executing command {} for container {} in pod {}",
-            command, container_name, pod_name
-        );
+        opts: CommandOptions,
+    ) -> anyhow::Result<String> {
+        let command = opts.command;
 
         let handles = self.shared.handles.read().await;
         let handle = handles

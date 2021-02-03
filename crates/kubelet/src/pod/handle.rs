@@ -7,6 +7,7 @@ use tokio::sync::RwLock;
 use crate::container::{
     ContainerKey, ContainerMapByName, Handle as ContainerHandle, HandleMap as ContainerHandleMap,
 };
+use crate::exec::Command;
 use crate::handle::{ExecHandler, StopHandler};
 use crate::log::{HandleFactory, Sender};
 use crate::pod::Pod;
@@ -75,11 +76,7 @@ impl<H: StopHandler + ExecHandler, F> Handle<H, F> {
     }
 
     /// Exec a command in the specified container
-    pub async fn exec(
-        &self,
-        container_name: String,
-        command: String,
-    ) -> anyhow::Result<Vec<String>> {
+    pub async fn exec(&self, container_name: String, command: Command) -> anyhow::Result<String> {
         let mut handles = self.container_handles.write().await;
         let handle = handles
             .get_mut_by_name(container_name.clone())
