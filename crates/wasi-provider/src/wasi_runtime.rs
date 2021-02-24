@@ -397,22 +397,30 @@ impl WasiRuntime {
                         let result = func.and_then(|func| {
                             let args = parse_args(func.ty(), &command.args);
 
-                            let result = args.and_then(|args| {
-                                let result = func
-                                    .call(&args)
-                                    .map(|result| {
-                                        let values: Vec<String> =
-                                            result.into_iter().map(|v| stringify_val(v)).collect();
-                                        let message = values.join("\n");
+                            let result = args
+                                .and_then(|args| {
+                                    info!("Parsed args: {:?}", args);
 
-                                        info!("Exec command result: {}", message);
+                                    let result = func
+                                        .call(&args)
+                                        .map(|result| {
+                                            let values: Vec<String> = result
+                                                .into_iter()
+                                                .map(|v| stringify_val(v))
+                                                .collect();
+                                            let message = values.join("\n");
 
-                                        message
-                                    })
-                                    .map_err(|e| anyhow::anyhow!("Error executing command {}", e));
+                                            info!("Exec command result: {}", message);
 
-                                result
-                            });
+                                            message
+                                        })
+                                        .map_err(|e| {
+                                            anyhow::anyhow!("Error executing command: {}", e)
+                                        });
+
+                                    result
+                                })
+                                .map_err(|e| anyhow::anyhow!("Error parsing the args: {}", e));
 
                             result
                         });
