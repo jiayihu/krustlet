@@ -2,6 +2,7 @@ use crate::config::ServerConfig;
 use crate::exec::{Command, CommandOptions};
 use crate::log::{Options as LogOptions, Sender};
 use crate::provider::{NotImplementedError, Provider};
+use futures::{FutureExt, StreamExt};
 use http::status::StatusCode;
 use http::Response;
 use hyper::Body;
@@ -11,6 +12,7 @@ use hyper::Body;
 use log::{debug, error};
 use std::convert::Infallible;
 use std::sync::Arc;
+use warp::ws::{Message, WebSocket};
 use warp::Filter;
 
 const PING: &str = "this is the Krustlet HTTP server";
@@ -34,18 +36,21 @@ pub(crate) async fn start<T: Provider>(
             get_container_logs(provider, namespace, pod, container, opts)
         });
 
-    let exec_provider = provider.clone();
-    let exec = warp::post()
-        .and(warp::path!("exec" / String / String / String))
+    let ws_exec_provider = provider.clone();
+    let ws_exec = warp::path!("exec" / String / String / String)
         // The default query filter doesn't allow duplicate command query, which instead happens with
         // exec, e.g. `?command=add&command=1&command=2`
         .and(warp::query::raw())
-        .and_then(move |namespace, pod, container, opts| {
-            let provider = exec_provider.clone();
-            post_exec(provider, namespace, pod, container, opts)
+        .and(warp::ws())
+        .map(move |namespace, pod, container, opts, ws: warp::ws::Ws| {
+            let provider = ws_exec_provider.clone();
+
+            ws.on_upgrade(move |websocket| {
+                handle_exec(provider, namespace, pod, container, opts, websocket)
+            })
         });
 
-    let routes = ping.or(health).or(logs).or(exec);
+    let routes = ping.or(health).or(logs).or(ws_exec).with(warp::log("api"));
 
     warp::serve(routes)
         .tls()
@@ -92,16 +97,22 @@ async fn get_container_logs<T: Provider>(
     }
 }
 
-/// Run a pod exec command and get the output
-///
-/// Implements the kubelet path /exec/{namespace}/{pod}/{container}
-async fn post_exec<T: Provider>(
+// Byte indicating the message channel
+// https://github.com/clux/kube-rs/blob/33207f9589/kube/src/api/remote_command.rs#L160
+// const STDIN_CHANNEL: u8 = 0;
+const STDOUT_CHANNEL: u8 = 1;
+const STDERR_CHANNEL: u8 = 2;
+// const STATUS_CHANNEL: u8 = 3;
+// const RESIZE_CHANNEL: u8 = 4;
+
+async fn handle_exec<T: Provider>(
     provider: Arc<T>,
     namespace: String,
     pod: String,
     container: String,
     query: String,
-) -> Result<Response<Body>, Infallible> {
+    socket: WebSocket,
+) {
     debug!(
         "Got container exec request for container {} in pod {} in namespace {}. Query: {:?}",
         namespace, pod, container, query
@@ -109,16 +120,37 @@ async fn post_exec<T: Provider>(
 
     let opts = parse_exec_query(&query);
 
-    match opts {
-        Ok(opts) => match provider.exec(namespace, pod, container, opts).await {
-            Ok(result) => {
-                let body = Body::from(result);
+    if let Ok(opts) = opts {
+        let (ws_tx, _) = socket.split();
 
-                Ok(Response::new(body))
+        let result = futures::stream::once(async {
+            let result = provider.exec(namespace, pod, container, opts).await;
+
+            match result {
+                Ok(s) => {
+                    let mut payload = vec![STDOUT_CHANNEL];
+                    payload.append(&mut s.into_bytes());
+
+                    Ok(Message::binary(payload))
+                }
+                Err(e) => {
+                    let mut payload = vec![STDERR_CHANNEL];
+                    let mut error_msg = format!("{}", e).into_bytes();
+                    payload.append(&mut error_msg);
+
+                    Ok(Message::binary(payload))
+                }
             }
-            Err(e) => return_with_code(StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)),
-        },
-        Err(e) => return_with_code(StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)),
+        });
+
+        result
+            .forward(ws_tx)
+            .map(|result| {
+                if let Err(e) = result {
+                    log::info!("Websocket error: {:?}", e);
+                }
+            })
+            .await
     }
 }
 

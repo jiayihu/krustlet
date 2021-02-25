@@ -71,9 +71,7 @@ impl<P: Provider> Kubelet<P> {
             .boxed();
 
         // Start the webserver
-        let webserver = start_webserver(self.provider.clone(), &self.config.server_config)
-            .fuse()
-            .boxed();
+        let webserver = start_webserver(self.provider.clone(), &self.config.server_config).fuse();
 
         // Start updating the node lease and status periodically
         let node_updater = start_node_updater(client.clone(), self.config.node_name.clone())
